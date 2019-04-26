@@ -51,6 +51,8 @@ static char usage[] =
 
 static char * progname;
 
+#define MAX_ANSIBUF 100
+
 static int curses_started = 0;
 static int height = 24, width = 80;
 static int screen_size_changed = 0;
@@ -95,49 +97,13 @@ static int incoming_rows;
 
 static void get_terminal_size(void)
 {
-#if 0
-    struct winsize w;
-    if (!incoming_cols) { // have we checked COLUMNS?
-        const char * s = getenv("COLUMNS");
-        incoming_cols = -1;
-        if (s && *s) {
-            long t;
-            char * endptr;
-            t = strtol(s, &endptr, 0);
-            if (!*endptr && (t > 0) && (t < (long)666)) incoming_cols = (int)t;
-            width = incoming_cols;
-            snprintf(env_col_buf, sizeof env_col_buf, "COLUMNS=%d", width);
-            putenv(env_col_buf);
-        }
+    int newHeight = PDC_get_rows();
+    int newWidth = PDC_get_columns();
+    if ((newWidth != width) || (newHeight != height)) {
+        width = newWidth;
+        height = newHeight;
+        screen_size_changed = TRUE;
     }
-    if (!incoming_rows) { // have we checked LINES?
-        const char * s = getenv("LINES");
-        incoming_rows = -1;
-        if (s && *s) {
-            long t;
-            char * endptr;
-            t = strtol(s, &endptr, 0);
-            if (!*endptr && (t > 0) && (t < (long)666)) incoming_rows = (int)t;
-            height = incoming_rows;
-            snprintf(env_row_buf, sizeof env_row_buf, "LINES=%d", height);
-            putenv(env_row_buf);
-        }
-    }
-    if ((incoming_cols < 0) || (incoming_rows < 0)) {
-        if (ioctl(2, TIOCGWINSZ, &w) == 0) {
-            if ((incoming_rows < 0) && (w.ws_row > 0)) {
-                height = w.ws_row;
-                snprintf(env_row_buf, sizeof env_row_buf, "LINES=%d", height);
-                putenv(env_row_buf);
-            }
-            if ((incoming_cols < 0) && (w.ws_col > 0)) {
-                width = w.ws_col;
-                snprintf(env_col_buf, sizeof env_col_buf, "COLUMNS=%d", width);
-                putenv(env_col_buf);
-            }
-        }
-    }
-#endif /* if 0 */
 }
 
 int vasprintf(char ** str, const char * fmt, va_list args)
@@ -200,6 +166,141 @@ void usleep(__int64 usec)
     SetWaitableTimer(timer, &ft, 0, NULL, NULL, 0);
     WaitForSingleObject(timer, INFINITE);
     CloseHandle(timer);
+}
+
+static int nr_of_colors;
+static int attributes;
+static int fg_col;
+static int bg_col;
+
+static void reset_ansi(void)
+{
+    attributes = A_NORMAL;
+    fg_col = 0;
+    bg_col = 0;
+}
+
+static void init_ansi_colors(void)
+{
+    short ncurses_colors[] = {
+        -1, COLOR_BLACK, COLOR_RED, COLOR_GREEN, COLOR_YELLOW,
+        COLOR_BLUE, COLOR_MAGENTA, COLOR_CYAN, COLOR_WHITE
+    };
+
+    nr_of_colors = sizeof(ncurses_colors) / sizeof(short);
+
+    for (bg_col = 0; bg_col < nr_of_colors; bg_col++)
+        for (fg_col = 0; fg_col < nr_of_colors; fg_col++)
+            init_pair(bg_col * nr_of_colors + fg_col + 1, ncurses_colors[fg_col], ncurses_colors[bg_col]);
+    reset_ansi();
+}
+
+static int set_ansi_attribute(const int attrib)
+{
+    switch (attrib) {
+        case -1: /* restore last settings */
+            break;
+        case 0: /* restore default settings */
+            reset_ansi();
+            break;
+        case 1: /* set bold / increased intensity */
+            attributes |= A_BOLD;
+            break;
+        case 2: /* set decreased intensity (if supported) */
+            attributes |= A_DIM;
+            break;
+#ifdef A_ITALIC
+        case 3: /* set italic (if supported) */
+            attributes |= A_ITALIC;
+            break;
+#endif
+        case 4: /* set underline */
+            attributes |= A_UNDERLINE;
+            break;
+        case 5: /* set blinking */
+            attributes |= A_BLINK;
+            break;
+        case 7: /* set inversed */
+            attributes |= A_REVERSE;
+            break;
+        case 21: /* unset bold / increased intensity */
+            attributes &= ~A_BOLD;
+            break;
+        case 22: /* unset bold / any intensity modifier */
+            attributes &= ~(A_BOLD | A_DIM);
+            break;
+#ifdef A_ITALIC
+        case 23: /* unset italic */
+            attributes &= ~A_ITALIC;
+            break;
+#endif
+        case 24: /* unset underline */
+            attributes &= ~A_UNDERLINE;
+            break;
+        case 25: /* unset blinking */
+            attributes &= ~A_BLINK;
+            break;
+        case 27: /* unset inversed */
+            attributes &= ~A_REVERSE;
+            break;
+        case 39:
+            fg_col = 0;
+            break;
+        case 49:
+            bg_col = 0;
+            break;
+        default:
+            if (( attrib >= 30) && ( attrib <= 37) ) { /* set foreground color */
+                fg_col = attrib - 30 + 1;
+            } else if (( attrib >= 40) && ( attrib <= 47) ) { /* set background color */
+                bg_col = attrib - 40 + 1;
+            } else {
+                return 0; /* Not understood */
+            }
+    }
+    attrset(attributes | COLOR_PAIR(bg_col * nr_of_colors + fg_col + 1));
+    return 1;
+}
+
+static void process_ansi(FILE * fp)
+{
+    int i, c;
+    char buf[MAX_ANSIBUF];
+    char * numstart, * endptr;
+
+    c = getc(fp);
+    if (c != '[') {
+        ungetc(c, fp);
+        return;
+    }
+    for (i = 0; i < MAX_ANSIBUF; i++) {
+        c = getc(fp);
+        /* COLOUR SEQUENCE ENDS in 'm' */
+        if (c == 'm') {
+            buf[i] = '\0';
+            break;
+        }
+        if (((c < '0') || (c > '9')) && (c != ';')) {
+            return;
+        }
+        buf[i] = (char)c;
+    }
+    /*
+     * buf now contains a semicolon-separated list of decimal integers,
+     * each indicating an attribute to apply.
+     * For example, buf might contain "0;1;31", derived from the color
+     * escape sequence "<ESC>[0;1;31m". There can be 1 or more
+     * attributes to apply, but typically there are between 1 and 3.
+     */
+
+    /* Special case of <ESC>[m */
+    if (buf[0] == '\0')
+        set_ansi_attribute(0);
+
+    for (endptr = numstart = buf; *endptr != '\0'; numstart = endptr + 1) {
+        if (!set_ansi_attribute(strtol(numstart, &endptr, 10)))
+            break;
+    }
 }
 
 int main(int argc, char * argv[])
@@ -284,6 +385,7 @@ int main(int argc, char * argv[])
         command[command_length] = '\0';
     }
 
+    PDC_scr_open(argc, argv);
     get_terminal_size();
 
     /* Catch keyboard interrupts so we can put tty back in a sane state.  */
@@ -299,6 +401,10 @@ int main(int argc, char * argv[])
     noecho();
     cbreak();
 
+    start_color();
+    use_default_colors();
+    init_ansi_colors();
+
     for (;;) {
         time_t t = time(NULL);
         char * ts = ctime(&t);
@@ -308,11 +414,12 @@ int main(int argc, char * argv[])
         int x, y;
         int oldeolseen = 1;
 
+        get_terminal_size();
         if (screen_size_changed) {
-            get_terminal_size();
-            // resizeterm(height, width);
+            PDC_resize_screen(height, width);
+            resize_term(height, width);
             clear();
-            /* redrawwin(stdscr); */
+            redrawwin(stdscr);
             screen_size_changed = 0;
             first_screen = 1;
         }
@@ -334,11 +441,16 @@ int main(int argc, char * argv[])
             do_exit(2);
         }
 
+        reset_ansi();
         for (y = show_title; y < height; y++) {
-            int eolseen = 0, tabpending = 0;
+            int eolseen = 0, tabpending = 0, tabwaspending = 0;
             for (x = 0; x < width; x++) {
                 int c = ' ';
                 int attr = 0;
+
+                if (tabwaspending)
+                    set_ansi_attribute(-1);
+                tabwaspending = 0;
 
                 if (!eolseen) {
                     /* if there is a tab pending, just spit spaces until the
@@ -348,7 +460,15 @@ int main(int argc, char * argv[])
                             c = getc(p);
                         while (c != EOF && !isprint(c)
                                && c != '\n'
-                               && c != '\t');
+                               && c != '\t'
+                               && c != '\033');
+
+                    if (( c == L'\033')) {
+                        x--;
+                        process_ansi(p);
+                        continue;
+                    }
+
                     if (c == '\n')
                         if (!oldeolseen && (x == 0)) {
                             x = -1;
@@ -357,10 +477,14 @@ int main(int argc, char * argv[])
                             eolseen = 1;
                     else if (c == '\t')
                         tabpending = 1;
-                    if ((c == EOF) || (c == '\n') || (c == '\t'))
+                    if ((c == EOF) || (c == '\n') || (c == '\t')) {
                         c = ' ';
-                    if (tabpending && (((x + 1) % 8) == 0))
+                        attrset(A_NORMAL);
+                    }
+                    if (tabpending && (((x + 1) % 8) == 0)) {
                         tabpending = 0;
+                        tabwaspending = 1;
+                    }
                 }
                 move(y, x);
                 if (option_differences) {
